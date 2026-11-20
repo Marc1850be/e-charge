@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="fr-BE">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b1120" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>E-Charge</title>
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+  <link rel="apple-touch-icon" href="./icon-192.png" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- TOP ZONE: Read-only summary -->
+    <header id="topZone" class="top-zone"></header>
+
+    <!-- MIDDLE-BOTTOM: 100% Thumb-reachable workspace -->
+    <main class="thumb-zone">
+      <div id="metaArea" style="display:flex;flex-direction:column;gap:6px"></div>
+      <div id="fieldsArea" class="fields-stack"></div>
+      <div id="validationBox" class="info-box hidden"></div>
+      <div id="voiceBanner" class="voice-banner hidden"></div>
+      <div id="quickChips" class="chips-row"></div>
+      <div id="keypad" class="keypad"></div>
+      <div id="actionRow" class="action-row">
+        <button id="btnSubmit" class="btn-submit" onclick="App.submitSession()"></button>
+        <button id="btnMic" class="btn-mic" onclick="App.openAndStartVoice()" aria-label="Dicter à la voix">
+          <span class="mic-icon">🎙️</span>
+          <span>Voix</span>
+        </button>
+      </div>
+    </main>
+
+    <!-- BOTTOM ANCHOR: Car Switcher -->
+    <nav id="bottomTabs" class="bottom-tabs" aria-label="Sélection voiture"></nav>
+  </div>
+
+  <!-- Bottom Sheet Modal -->
+  <div id="sheetBackdrop" class="sheet-backdrop hidden" onclick="if (event.target === this) App.closeSheet()">
+    <div id="bottomSheet" class="bottom-sheet" role="dialog" aria-modal="true"></div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <script src="./voice.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

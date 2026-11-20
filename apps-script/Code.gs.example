@@ -1,0 +1,436 @@
+/**
+ * E-Charge — Backend Google Apps Script pour la feuille "E charge"
+ * ----------------------------------------------------------------
+ * Installation :
+ * 1. Ouvrez votre Google Sheet "E charge"
+ * 2. Menu Extensions -> Apps Script
+ * 3. Remplacez tout le contenu de Code.gs par ce fichier
+ * 4. Changez SECRET_PIN ci-dessous par votre code personnel
+ * 5. Déployer -> Nouveau déploiement -> Application Web
+ *    - Exécuter en tant que : Moi
+ *    - Qui a accès : Tout le monde (protégé par votre SECRET_PIN)
+ * 6. Copiez l'URL de l'application Web dans les réglages de la PWA.
+ */
+
+const CONFIG = {
+  // Changez ce code par votre code secret personnel (4 à 12 caractères)
+  SECRET_PIN: '2026',
+
+  // ID de la feuille "E charge" (utilisé en secours si script non lié)
+  FALLBACK_SPREADSHEET_ID: 'VOTRE_SPREADSHEET_ID_ICI',
+
+  CARS: [
+    {
+      id: 'peugeot',
+      name: 'Peugeot e5008',
+      plate: '',
+      sheetName: 'Onglet Voiture 1',
+      avgRangePerPct: 3.9
+    },
+    {
+      id: 'merco',
+      name: 'Mercedes GLB',
+      plate: '',
+      sheetName: 'Onglet Voiture 2',
+      avgRangePerPct: 4.8
+    }
+  ]
+};
+
+/**
+ * GET ?action=status&pin=XXXX
+ */
+function doGet(e) {
+  try {
+    const params = (e && e.parameter) || {};
+    assertAuthorized_(params.pin);
+    return jsonResponse_({
+      ok: true,
+      timestamp: new Date().toISOString(),
+      data: getAllStatus_()
+    });
+  } catch (err) {
+    return jsonResponse_({ ok: false, error: err.message || String(err) });
+  }
+}
+
+/**
+ * POST text/plain contenant du JSON (évite le preflight CORS OPTIONS)
+ * Actions : status | start | finish | skipEnd | reopenSkipped
+ */
+function doPost(e) {
+  const lock = LockService.getScriptLock();
+  try {
+    const raw = e && e.postData && e.postData.contents ? e.postData.contents : '{}';
+    const body = JSON.parse(raw);
+    assertAuthorized_(body.pin);
+
+    const action = body.action || 'status';
+    if (action === 'status') {
+      return jsonResponse_({ ok: true, timestamp: new Date().toISOString(), data: getAllStatus_() });
+    }
+
+    if (!lock.tryLock(15000)) {
+      throw new Error('Feuille occupée, réessayez dans quelques secondes.');
+    }
+
+    const carCfg = getCarConfig_(body.carId);
+    const sheet = getSheet_(carCfg.sheetName);
+    let resultInfo = {};
+
+    if (action === 'start') {
+      resultInfo = handleStart_(sheet, carCfg, body);
+    } else if (action === 'finish') {
+      resultInfo = handleFinish_(sheet, carCfg, body);
+    } else if (action === 'skipEnd') {
+      resultInfo = handleSkipEnd_(sheet, carCfg, body);
+    } else if (action === 'reopenSkipped') {
+      resultInfo = handleReopenSkipped_(carCfg);
+    } else {
+      throw new Error('Action inconnue : ' + action);
+    }
+
+    SpreadsheetApp.flush();
+    return jsonResponse_({
+      ok: true,
+      timestamp: new Date().toISOString(),
+      result: resultInfo,
+      data: getAllStatus_()
+    });
+  } catch (err) {
+    return jsonResponse_({ ok: false, error: err.message || String(err) });
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/**
+ * Fonction de test à lancer directement dans l'éditeur Apps Script
+ * pour autoriser les permissions et vérifier la lecture des 2 onglets.
+ */
+function testStatus() {
+  const status = getAllStatus_();
+  Logger.log(JSON.stringify(status, null, 2));
+}
+
+// ============================================================================
+// LOGIQUE MÉTIER
+// ============================================================================
+
+function getSpreadsheet_() {
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active) return active;
+  return SpreadsheetApp.openById(CONFIG.FALLBACK_SPREADSHEET_ID);
+}
+
+function getSheet_(sheetName) {
+  const ss = getSpreadsheet_();
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    throw new Error('Onglet introuvable : "' + sheetName + '"');
+  }
+  return sheet;
+}
+
+function getCarConfig_(carId) {
+  const found = CONFIG.CARS.find(function (c) { return c.id === carId; });
+  if (!found) throw new Error('Voiture inconnue : ' + carId);
+  return found;
+}
+
+function assertAuthorized_(pin) {
+  if (!CONFIG.SECRET_PIN) return;
+  if (String(pin || '').trim() !== String(CONFIG.SECRET_PIN).trim()) {
+    throw new Error('Code PIN incorrect.');
+  }
+}
+
+function normalizeStr_(val) {
+  return String(val || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Repère dynamiquement les colonnes depuis la ligne 4 (résiste aux ajouts/suppressions de colonnes)
+ */
+function resolveColumns_(sheet) {
+  const maxCol = Math.min(sheet.getLastColumn(), 30);
+  const headers = sheet.getRange(4, 1, 1, maxCol).getValues()[0];
+  const cols = {
+    lieu: 3,       // C
+    pays: 4,       // D
+    km: 5,         // E
+    pctStart: 6,   // F
+    rangeStart: 7, // G
+    pctEnd: 8,     // H
+    rangeEnd: 9,   // I
+    comment: 21    // U (après suppression de la colonne J)
+  };
+
+  for (let i = 0; i < headers.length; i++) {
+    const h = normalizeStr_(headers[i]);
+    const colNum = i + 1;
+    if (!h) continue;
+    if (h.indexOf('lieu') !== -1) cols.lieu = colNum;
+    else if (h === 'pays') cols.pays = colNum;
+    else if (h.indexOf('kilom') !== -1) cols.km = colNum;
+    else if (h.indexOf('%') !== -1 && h.indexOf('debut') !== -1) cols.pctStart = colNum;
+    else if (h.indexOf('autonomie') !== -1 && h.indexOf('debut') !== -1) cols.rangeStart = colNum;
+    else if (h.indexOf('%') !== -1 && h.indexOf('fin') !== -1) cols.pctEnd = colNum;
+    else if (h.indexOf('autonomie') !== -1 && h.indexOf('fin') !== -1) cols.rangeEnd = colNum;
+    else if (h.indexOf('comment') !== -1) cols.comment = colNum;
+  }
+  return cols;
+}
+
+function findBilanRow_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 5) return lastRow + 1;
+  const colA = sheet.getRange(5, 1, lastRow - 4, 1).getValues();
+  for (let i = 0; i < colA.length; i++) {
+    const t = normalizeStr_(colA[i][0]);
+    if (t.indexOf('bilan') === 0 || t === 'total') {
+      return 5 + i;
+    }
+  }
+  return lastRow + 1;
+}
+
+function normalizePctRead_(val) {
+  if (val === '' || val === null || val === undefined) return null;
+  const n = Number(val);
+  if (isNaN(n)) return null;
+  if (n > 0 && n <= 1.01) return Math.round(n * 100);
+  if (n === 0) return 0;
+  return Math.round(n);
+}
+
+function toNumOrNull_(val) {
+  if (val === '' || val === null || val === undefined) return null;
+  const n = Number(val);
+  return isNaN(n) ? null : Math.round(n);
+}
+
+function getAllStatus_() {
+  const props = PropertiesService.getScriptProperties();
+  const carsOut = {};
+  CONFIG.CARS.forEach(function (carCfg) {
+    const sheet = getSheet_(carCfg.sheetName);
+    carsOut[carCfg.id] = analyzeSheet_(sheet, carCfg, props);
+  });
+  return { cars: carsOut };
+}
+
+function analyzeSheet_(sheet, carCfg, props) {
+  const cols = resolveColumns_(sheet);
+  const bilanRow = findBilanRow_(sheet);
+  const scanEnd = Math.max(5, bilanRow - 1);
+  const maxReadCol = Math.max(cols.comment, cols.rangeEnd, 9);
+  const numRows = scanEnd - 4;
+
+  const range = sheet.getRange(5, 1, numRows, maxReadCol);
+  const values = range.getValues();
+  const formulas = range.getFormulas();
+
+  let lastFilledRow = null;
+  let lastFilledData = null;
+  const placeCounts = {};
+  const filledHistory = [];
+
+  for (let i = 0; i < values.length; i++) {
+    const rowNum = 5 + i;
+    const rowVals = values[i];
+    const rowForms = formulas[i];
+
+    const kmRaw = rowVals[cols.km - 1];
+    const kmForm = rowForms[cols.km - 1];
+    const isKmNumeric = typeof kmRaw === 'number' && !isNaN(kmRaw) && kmRaw > 0 && !kmForm;
+
+    if (isKmNumeric) {
+      const lieu = String(rowVals[cols.lieu - 1] || 'Home').trim();
+      const pays = String(rowVals[cols.pays - 1] || 'Be').trim();
+      const entry = {
+        row: rowNum,
+        lieu: lieu,
+        pays: pays,
+        km: Math.round(kmRaw),
+        pctStart: normalizePctRead_(rowVals[cols.pctStart - 1]),
+        rangeStart: toNumOrNull_(rowVals[cols.rangeStart - 1]),
+        pctEnd: normalizePctRead_(rowVals[cols.pctEnd - 1]),
+        rangeEnd: toNumOrNull_(rowVals[cols.rangeEnd - 1]),
+        comment: String(rowVals[cols.comment - 1] || '').trim()
+      };
+
+      lastFilledRow = rowNum;
+      lastFilledData = entry;
+      filledHistory.push(entry);
+
+      if (lieu && lieu.toLowerCase() !== 'home') {
+        const key = lieu + '||' + (pays || 'Be');
+        placeCounts[key] = (placeCounts[key] || 0) + 1;
+      }
+    }
+  }
+
+  // Lieux fréquents (Home toujours en premier + top 7 historiques)
+  const frequentPlaces = [{ label: 'Home', country: 'Be' }];
+  Object.keys(placeCounts)
+    .sort(function (a, b) { return placeCounts[b] - placeCounts[a]; })
+    .slice(0, 7)
+    .forEach(function (k) {
+      const parts = k.split('||');
+      frequentPlaces.push({ label: parts[0], country: parts[1] || 'Be' });
+    });
+
+  // Détection d'une charge en cours (et gestion du "ignorer la fin")
+  const skippedProp = Number(props.getProperty('skipped_' + carCfg.id) || 0);
+  let openSession = null;
+  let recentlySkippedRow = null;
+
+  if (lastFilledData && lastFilledData.pctEnd === null && lastFilledData.rangeEnd === null) {
+    if (skippedProp === lastFilledData.row) {
+      recentlySkippedRow = lastFilledData.row;
+    } else {
+      openSession = lastFilledData;
+    }
+  }
+
+  const nextRow = lastFilledRow ? lastFilledRow + 1 : 6;
+
+  return {
+    id: carCfg.id,
+    name: carCfg.name,
+    plate: carCfg.plate,
+    sheetName: carCfg.sheetName,
+    avgRangePerPct: carCfg.avgRangePerPct,
+    bilanRow: bilanRow,
+    lastKm: lastFilledData ? lastFilledData.km : 0,
+    nextRow: nextRow,
+    openSession: openSession,
+    recentlySkippedRow: recentlySkippedRow,
+    frequentPlaces: frequentPlaces,
+    recentRows: filledHistory.slice(-5).reverse(),
+    columns: cols
+  };
+}
+
+/**
+ * Si on atteint la ligne Bilan, on insère une ligne juste au-dessus
+ * en recopiant les formules (A, J..S) de la ligne précédente.
+ */
+function ensureRowBeforeBilan_(sheet, targetRow, bilanRow) {
+  if (targetRow < bilanRow) return;
+  sheet.insertRowBefore(bilanRow);
+  const srcRow = bilanRow - 1;
+  const maxCol = sheet.getLastColumn();
+  sheet.getRange(srcRow, 1, 1, maxCol).copyTo(
+    sheet.getRange(bilanRow, 1, 1, maxCol),
+    SpreadsheetApp.CopyPasteType.PASTE_NORMAL,
+    false
+  );
+  // Vide uniquement les cellules de saisie manuelle (E..I et Comment)
+  const cols = resolveColumns_(sheet);
+  [cols.km, cols.pctStart, cols.rangeStart, cols.pctEnd, cols.rangeEnd, cols.comment].forEach(function (c) {
+    sheet.getRange(bilanRow, c).clearContent();
+  });
+}
+
+function handleStart_(sheet, carCfg, body) {
+  const props = PropertiesService.getScriptProperties();
+  const info = analyzeSheet_(sheet, carCfg, props);
+  const cols = info.columns;
+
+  const km = Number(body.km);
+  const pctStart = Number(body.pctStart);
+  const rangeStart = Number(body.rangeStart);
+
+  if (!km || isNaN(km) || km <= 0) throw new Error('Kilométrage invalide.');
+  if (isNaN(pctStart) || pctStart < 0 || pctStart > 100) throw new Error('Pourcentage début invalide (0-100).');
+  if (isNaN(rangeStart) || rangeStart < 0) throw new Error('Autonomie début invalide.');
+
+  const targetRow = info.nextRow;
+  ensureRowBeforeBilan_(sheet, targetRow, info.bilanRow);
+
+  const lieu = String(body.lieu || 'Home').trim() || 'Home';
+  const pays = String(body.pays || 'Be').trim() || 'Be';
+  const comment = String(body.comment || '').trim();
+
+  sheet.getRange(targetRow, cols.lieu).setValue(lieu);
+  sheet.getRange(targetRow, cols.pays).setValue(pays);
+  sheet.getRange(targetRow, cols.km).setValue(Math.round(km)).setNumberFormat('#,##0" km"');
+  sheet.getRange(targetRow, cols.pctStart).setValue(pctStart / 100).setNumberFormat('0%');
+  sheet.getRange(targetRow, cols.rangeStart).setValue(Math.round(rangeStart)).setNumberFormat('#,##0" km"');
+
+  if (comment) {
+    sheet.getRange(targetRow, cols.comment).setValue(comment).setNumberFormat('@');
+  }
+
+  props.deleteProperty('skipped_' + carCfg.id);
+  return { action: 'start', row: targetRow };
+}
+
+function handleFinish_(sheet, carCfg, body) {
+  const props = PropertiesService.getScriptProperties();
+  const info = analyzeSheet_(sheet, carCfg, props);
+  const cols = info.columns;
+
+  const targetRow = Number(body.row) || (info.openSession && info.openSession.row);
+  if (!targetRow || targetRow < 5 || targetRow >= info.bilanRow) {
+    throw new Error('Aucune charge en cours trouvée à terminer.');
+  }
+
+  const hasPct = body.pctEnd !== null && body.pctEnd !== undefined && body.pctEnd !== '';
+  const hasRange = body.rangeEnd !== null && body.rangeEnd !== undefined && body.rangeEnd !== '';
+  if (!hasPct && !hasRange) {
+    return handleSkipEnd_(sheet, carCfg, { row: targetRow });
+  }
+
+  if (hasPct) {
+    const pctEnd = Number(body.pctEnd);
+    if (isNaN(pctEnd) || pctEnd < 0 || pctEnd > 100) throw new Error('Pourcentage fin invalide (0-100).');
+    sheet.getRange(targetRow, cols.pctEnd).setValue(pctEnd / 100).setNumberFormat('0%');
+  }
+
+  if (hasRange) {
+    const rangeEnd = Number(body.rangeEnd);
+    if (isNaN(rangeEnd) || rangeEnd < 0) throw new Error('Autonomie fin invalide.');
+    sheet.getRange(targetRow, cols.rangeEnd).setValue(Math.round(rangeEnd)).setNumberFormat('#,##0" km"');
+  }
+
+  const comment = String(body.comment || '').trim();
+  if (comment) {
+    const cell = sheet.getRange(targetRow, cols.comment);
+    const existing = String(cell.getValue() || '').trim();
+    cell.setValue(existing ? existing + ' | ' + comment : comment).setNumberFormat('@');
+  }
+
+  props.deleteProperty('skipped_' + carCfg.id);
+  return { action: 'finish', row: targetRow };
+}
+
+function handleSkipEnd_(sheet, carCfg, body) {
+  const props = PropertiesService.getScriptProperties();
+  const info = analyzeSheet_(sheet, carCfg, props);
+  const targetRow = Number(body.row) || (info.openSession && info.openSession.row);
+  if (!targetRow) {
+    throw new Error('Aucune charge en cours à clôturer.');
+  }
+  props.setProperty('skipped_' + carCfg.id, String(targetRow));
+  return { action: 'skipEnd', row: targetRow };
+}
+
+function handleReopenSkipped_(carCfg) {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('skipped_' + carCfg.id);
+  return { action: 'reopenSkipped' };
+}
+
+function jsonResponse_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}

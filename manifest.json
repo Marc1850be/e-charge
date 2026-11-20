@@ -1,0 +1,31 @@
+{
+  "name": "E-Charge — Suivi Véhicules Électriques",
+  "short_name": "E-Charge",
+  "description": "Enregistrement rapide à 1 main et à la voix des charges Peugeot e5008 & Mercedes GLB vers Google Sheets.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b1120",
+  "theme_color": "#0b1120",
+  "lang": "fr-BE",
+  "icons": [
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
