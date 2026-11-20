@@ -179,23 +179,43 @@
   // =========================================================================
   // API GOOGLE APPS SCRIPT + FILE HORS-LIGNE
   // =========================================================================
+  function parseGasJson(text, apiUrl) {
+    const trimmed = String(text || '').trim();
+    if (trimmed.startsWith('<')) {
+      if (!String(apiUrl || '').includes('/exec')) {
+        throw new Error('URL invalide : elle doit se terminer par /exec (URL d\'Application Web).');
+      }
+      throw new Error('Google demande une connexion : dans Apps Script → Déployer, mettez « Qui a accès » sur « Tout le monde ».');
+    }
+    try {
+      return JSON.parse(trimmed);
+    } catch (_) {
+      throw new Error('Réponse inattendue de Google Apps Script.');
+    }
+  }
+
   async function apiGetStatus(silent) {
     if (!isConfigured()) return;
     state.syncing = true;
+    state.lastSyncError = '';
     render();
     try {
-      const url = new URL(state.settings.apiUrl.trim());
+      const apiUrl = state.settings.apiUrl.trim();
+      const url = new URL(apiUrl);
       url.searchParams.set('action', 'status');
       url.searchParams.set('pin', state.settings.pin || '');
       const res = await fetch(url.toString(), { method: 'GET', redirect: 'follow' });
-      const json = await res.json();
+      const text = await res.text();
+      const json = parseGasJson(text, apiUrl);
       if (!json.ok) throw new Error(json.error || 'Erreur API');
       state.data = json.data;
       state.lastSyncAt = new Date();
+      state.lastSyncError = '';
       saveStorage(STORAGE_KEYS.CACHE, state.data);
       if (!silent) showToast('Synchronisé avec Google Sheets');
     } catch (err) {
-      if (!silent) showToast(err.message || 'Impossible de joindre Google Sheets', 'error');
+      state.lastSyncError = err.message || 'Impossible de joindre Google Sheets';
+      if (!silent) showToast(state.lastSyncError, 'error');
     } finally {
       state.syncing = false;
       render();
@@ -203,15 +223,18 @@
   }
 
   async function apiPost(payload) {
+    const apiUrl = state.settings.apiUrl.trim();
     const body = Object.assign({}, payload, { pin: state.settings.pin || '' });
-    const res = await fetch(state.settings.apiUrl.trim(), {
+    const res = await fetch(apiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(body),
       redirect: 'follow'
     });
-    const json = await res.json();
+    const text = await res.text();
+    const json = parseGasJson(text, apiUrl);
     if (!json.ok) throw new Error(json.error || 'Erreur serveur');
+    state.lastSyncError = '';
     return json;
   }
 
@@ -721,6 +744,13 @@
         <div class="offline-banner">
           <span>Mode démo (non connecté à Google Sheets)</span>
           <button onclick="App.openSheet('settings')">Connecter</button>
+        </div>
+      `;
+    } else if (state.lastSyncError) {
+      bannerHtml = `
+        <div class="offline-banner" style="background:rgba(239,68,68,0.14);border-color:rgba(239,68,68,0.45);color:var(--error)">
+          <span>⚠️ ${escapeHtml(state.lastSyncError)}</span>
+          <button style="background:var(--error);color:#fff" onclick="App.openSheet('settings')">Réglages</button>
         </div>
       `;
     } else if (state.queue.length > 0) {
