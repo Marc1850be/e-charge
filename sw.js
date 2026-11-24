@@ -1,4 +1,4 @@
-const CACHE_NAME = 'e-charge-pwa-v2';
+const CACHE_NAME = 'e-charge-pwa-v3';
 const ASSETS = [
   './',
   './index.html',

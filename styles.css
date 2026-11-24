@@ -551,36 +551,103 @@ input, textarea {
 }
 
 .btn-mic {
-  width: 64px;
+  position: relative;
+  width: 58px;
+  min-height: 54px;
   flex-shrink: 0;
   border-radius: 16px;
-  border: 1.5px solid rgba(56, 189, 248, 0.5);
+  border: 2px solid rgba(56, 189, 248, 0.55);
   background: rgba(56, 189, 248, 0.14);
   color: var(--primary);
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 1px;
   cursor: pointer;
-  font-weight: 700;
-  font-size: 12px;
+  transition: transform 0.08s ease, background-color 0.15s ease, border-color 0.15s ease;
 }
 
 .btn-mic:active {
-  transform: scale(0.94);
+  transform: scale(0.93);
 }
 
 .btn-mic.listening {
   border-color: var(--error);
   background: rgba(239, 68, 68, 0.18);
   color: var(--error);
-  animation: pulse 1.2s infinite;
 }
 
-.btn-mic .mic-icon {
-  font-size: 18px;
-  line-height: 1;
+.mic-pulse-ring {
+  display: none;
+  position: absolute;
+  inset: -3px;
+  border-radius: 18px;
+  border: 2px solid var(--error);
+  pointer-events: none;
+}
+
+.btn-mic.listening .mic-pulse-ring {
+  display: block;
+  animation: micRing 1.35s cubic-bezier(0.2, 0.7, 0.3, 1) infinite;
+}
+
+@keyframes micRing {
+  0% { transform: scale(0.96); opacity: 0.75; }
+  75% { transform: scale(1.14); opacity: 0; }
+  100% { transform: scale(1.14); opacity: 0; }
+}
+
+.mic-svg {
+  display: block;
+}
+
+/* LIVE VOICE PROGRESS PILLS */
+.voice-pills {
+  display: grid;
+  gap: 7px;
+}
+
+.voice-pills.cols-3 {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.voice-pills.cols-2 {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.voice-pill {
+  padding: 9px 8px;
+  border-radius: 13px;
+  border: 1.5px solid var(--border);
+  background: var(--bg);
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.voice-pill.filled {
+  border-color: rgba(34, 197, 94, 0.55);
+  background: rgba(34, 197, 94, 0.12);
+}
+
+.voice-pill.next {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.22);
+}
+
+.voice-pill-label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.voice-pill-val {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.voice-pill.filled .voice-pill-val {
+  color: var(--success);
 }
 
 /* BOTTOM CAR SWITCHER */

@@ -195,7 +195,9 @@
   }
 
   async function apiGetStatus(silent) {
-    if (!isConfigured()) return;
+    if (!isConfigured() || state.syncing) return;
+    const prevCar = getCar();
+    const prevOpenRow = prevCar && prevCar.openSession ? prevCar.openSession.row : null;
     state.syncing = true;
     state.lastSyncError = '';
     render();
@@ -212,6 +214,19 @@
       state.lastSyncAt = new Date();
       state.lastSyncError = '';
       saveStorage(STORAGE_KEYS.CACHE, state.data);
+
+      const nextCar = getCar();
+      const nextOpenRow = nextCar && nextCar.openSession ? nextCar.openSession.row : null;
+      if (prevOpenRow !== nextOpenRow) {
+        state.activeField = nextOpenRow ? 'pctEnd' : 'km';
+        if (silent) {
+          showToast(
+            nextOpenRow
+              ? `⚡ Charge en cours détectée (ligne ${nextOpenRow})`
+              : '✓ Charge clôturée depuis un autre appareil'
+          );
+        }
+      }
       if (!silent) showToast('Synchronisé avec Google Sheets');
     } catch (err) {
       state.lastSyncError = err.message || 'Impossible de joindre Google Sheets';
@@ -219,6 +234,18 @@
     } finally {
       state.syncing = false;
       render();
+    }
+  }
+
+  function autoSyncIfStale(maxAgeMs) {
+    if (!isConfigured() || state.busy || state.syncing || state.voiceSessionActive) return;
+    if (state.queue.length > 0) {
+      flushQueue();
+      return;
+    }
+    const age = state.lastSyncAt ? (Date.now() - state.lastSyncAt.getTime()) : Infinity;
+    if (age >= (maxAgeMs || 4000)) {
+      apiGetStatus(true);
     }
   }
 
@@ -477,6 +504,7 @@
     const car = getCar(carId);
     state.activeField = car.openSession ? 'pctEnd' : 'km';
     render();
+    autoSyncIfStale(12000);
   }
 
   function setActiveField(field) {
@@ -536,32 +564,70 @@
   }
 
   // =========================================================================
-  // RECONNAISSANCE VOCALE (1 tap = écoute directe fr-BE)
+  // RECONNAISSANCE VOCALE (1 tap = capture guidée des 3 ou 2 valeurs fr-BE)
   // =========================================================================
+  let voiceRestartTimer = null;
+
+  function isVoiceCaptureComplete(car, draft) {
+    if (car.openSession) {
+      return draft.pctEnd !== '' && draft.rangeEnd !== '';
+    }
+    return draft.km !== '' && draft.pctStart !== '' && draft.rangeStart !== '';
+  }
+
+  function clearCurrentModeDraft() {
+    const car = getCar();
+    const draft = state.drafts[state.activeCar];
+    if (car.openSession) {
+      draft.pctEnd = '';
+      draft.rangeEnd = '';
+    } else {
+      draft.km = '';
+      draft.pctStart = '';
+      draft.rangeStart = '';
+    }
+    saveStorage(STORAGE_KEYS.DRAFTS, state.drafts);
+  }
+
   function openAndStartVoice() {
     haptic(16);
-    if (state.voiceListening) {
+    if (state.voiceSessionActive || state.voiceListening) {
       stopVoice();
       state.activeSheet = null;
       render();
       return;
     }
     state.activeSheet = 'voice';
+    state.voiceSessionActive = true;
+    state.voiceIdleCount = 0;
+    state.voiceChunks = [];
     state.voiceInterim = '';
     state.voiceError = '';
     render();
-    startVoice();
+    startVoiceRound();
   }
 
   function startVoice() {
+    state.voiceSessionActive = true;
+    state.voiceIdleCount = 0;
+    state.voiceError = '';
+    startVoiceRound();
+  }
+
+  function startVoiceRound() {
+    clearTimeout(voiceRestartTimer);
     if (!window.EChargeVoice || !window.EChargeVoice.isSupported()) {
       state.voiceError = 'Reconnaissance vocale non supportée sur ce navigateur (utilisez Chrome sur Android ou saisissez votre phrase ci-dessous).';
       state.voiceListening = false;
+      state.voiceSessionActive = false;
       render();
       return;
     }
     try {
-      stopVoice();
+      if (recognizer) {
+        try { recognizer.onend = null; recognizer.onerror = null; recognizer.stop(); } catch (_) {}
+        recognizer = null;
+      }
       const rec = window.EChargeVoice.createRecognizer('fr-BE');
       state.voiceListening = true;
       state.voiceInterim = '';
@@ -578,8 +644,7 @@
         }
         state.voiceInterim = interim || finalText;
         if (finalText.trim()) {
-          state.voiceListening = false;
-          applyVoiceText(finalText.trim());
+          applyVoiceText(finalText.trim(), true);
         } else {
           renderSheet();
         }
@@ -587,9 +652,17 @@
 
       rec.onerror = (e) => {
         state.voiceListening = false;
+        if (e.error === 'no-speech' && state.voiceSessionActive && (state.voiceIdleCount || 0) < 2) {
+          state.voiceIdleCount = (state.voiceIdleCount || 0) + 1;
+          state.voiceInterim = '';
+          renderSheet();
+          return;
+        }
+        if (e.error === 'aborted') return;
+        state.voiceSessionActive = false;
         const map = {
           'not-allowed': 'Autorisez l\'accès au micro dans Chrome pour utiliser la dictée vocale.',
-          'no-speech': 'Aucune voix détectée — appuyez sur « Réessayer » et parlez près du micro.',
+          'no-speech': 'Silence détecté — appuyez sur le bouton ci-dessous pour continuer la dictée.',
           'network': 'Réseau requis par le moteur vocal Google (vous pouvez saisir au pavé hors-ligne).'
         };
         state.voiceError = map[e.error] || ('Erreur micro : ' + e.error);
@@ -597,52 +670,123 @@
       };
 
       rec.onend = () => {
+        recognizer = null;
         state.voiceListening = false;
-        render();
+        const car = getCar();
+        const draft = state.drafts[state.activeCar];
+        if (
+          state.voiceSessionActive &&
+          state.activeSheet === 'voice' &&
+          !isVoiceCaptureComplete(car, draft)
+        ) {
+          voiceRestartTimer = setTimeout(() => {
+            if (state.voiceSessionActive && state.activeSheet === 'voice') {
+              startVoiceRound();
+            }
+          }, 180);
+        } else {
+          render();
+        }
       };
 
       recognizer = rec;
       rec.start();
     } catch (err) {
       state.voiceListening = false;
+      state.voiceSessionActive = false;
       state.voiceError = 'Impossible de démarrer le micro : ' + (err.message || err);
       render();
     }
   }
 
   function stopVoice() {
+    clearTimeout(voiceRestartTimer);
+    state.voiceSessionActive = false;
     if (recognizer) {
-      try { recognizer.stop(); } catch (_) {}
+      try {
+        recognizer.onend = null;
+        recognizer.onerror = null;
+        recognizer.stop();
+      } catch (_) {}
       recognizer = null;
     }
     state.voiceListening = false;
   }
 
-  function applyVoiceText(transcript) {
+  function resetVoiceFields() {
+    haptic(12);
+    clearCurrentModeDraft();
+    state.voiceChunks = [];
+    state.lastTranscript = '';
+    state.voiceInterim = '';
+    state.voiceError = '';
+    state.voiceIdleCount = 0;
+    if (state.activeSheet === 'voice' && !state.voiceListening) {
+      startVoice();
+    } else {
+      render();
+    }
+  }
+
+  function applyVoiceText(transcript, fromLiveMic) {
     const car = getCar();
     const draft = state.drafts[state.activeCar];
     const open = Boolean(car.openSession);
-    const parsed = window.EChargeVoice.parseFrenchVoice(transcript, open, car.frequentPlaces);
+    const existing = {
+      km: draft.km !== '',
+      pct: open ? draft.pctEnd !== '' : draft.pctStart !== '',
+      range: open ? draft.rangeEnd !== '' : draft.rangeStart !== ''
+    };
+    const parsed = window.EChargeVoice.parseFrenchVoice(transcript, open, car.frequentPlaces, existing);
 
-    stopVoice();
-    state.activeSheet = null;
-    state.lastTranscript = transcript;
+    if (parsed.command === 'reset') {
+      resetVoiceFields();
+      showToast('Champs effacés — continuez à dicter');
+      return;
+    }
+    if (parsed.command === 'stop') {
+      stopVoice();
+      state.activeSheet = null;
+      render();
+      return;
+    }
 
-    let count = 0;
+    let added = 0;
     if (open) {
-      if (parsed.pct !== null && parsed.pct <= 100) { draft.pctEnd = String(parsed.pct); count++; }
-      if (parsed.range !== null) { draft.rangeEnd = String(parsed.range); count++; }
+      if (parsed.pct !== null && parsed.pct <= 100) { draft.pctEnd = String(parsed.pct); added++; }
+      if (parsed.range !== null) { draft.rangeEnd = String(parsed.range); added++; }
     } else {
-      if (parsed.km !== null) { draft.km = String(parsed.km); count++; }
-      if (parsed.pct !== null && parsed.pct <= 100) { draft.pctStart = String(parsed.pct); count++; }
-      if (parsed.range !== null) { draft.rangeStart = String(parsed.range); count++; }
+      if (parsed.km !== null) { draft.km = String(parsed.km); added++; }
+      if (parsed.pct !== null && parsed.pct <= 100) { draft.pctStart = String(parsed.pct); added++; }
+      if (parsed.range !== null) { draft.rangeStart = String(parsed.range); added++; }
       if (parsed.place) { draft.lieu = parsed.place.label; draft.pays = parsed.place.country; }
     }
 
+    state.voiceChunks = (state.voiceChunks || []).concat([transcript]);
+    state.lastTranscript = state.voiceChunks.join(' · ');
+    state.voiceInterim = '';
+    state.voiceIdleCount = 0;
     saveStorage(STORAGE_KEYS.DRAFTS, state.drafts);
-    haptic(20);
-    showToast(count > 0 ? `🎙️ ${count} champ(s) rempli(s) — vérifiez et validez` : 'Aucun chiffre détecté dans la phrase', count > 0 ? '' : 'warn');
-    render();
+
+    const complete = isVoiceCaptureComplete(car, draft);
+    if (complete || !fromLiveMic) {
+      stopVoice();
+      state.activeSheet = null;
+      haptic(complete ? [15, 45, 25] : 18);
+      const total = open ? 2 : 3;
+      const filled = open
+        ? (draft.pctEnd !== '' ? 1 : 0) + (draft.rangeEnd !== '' ? 1 : 0)
+        : (draft.km !== '' ? 1 : 0) + (draft.pctStart !== '' ? 1 : 0) + (draft.rangeStart !== '' ? 1 : 0);
+      showToast(
+        filled > 0 ? `🎙️ ${filled}/${total} valeurs remplies — vérifiez et validez` : 'Aucun chiffre détecté',
+        filled > 0 ? '' : 'warn'
+      );
+      render();
+    } else {
+      // Encore des valeurs manquantes : on reste ouvert et on continue l'écoute automatiquement !
+      if (added > 0) haptic(12);
+      render();
+    }
   }
 
   // =========================================================================
@@ -650,7 +794,7 @@
   // =========================================================================
   function openSheet(name) {
     haptic(8);
-    if (state.voiceListening) stopVoice();
+    if (state.voiceListening || state.voiceSessionActive) stopVoice();
     state.activeSheet = name;
     render();
   }
@@ -665,7 +809,8 @@
     e.preventDefault();
     state.settings.apiUrl = document.getElementById('cfgUrl').value.trim();
     state.settings.pin = document.getElementById('cfgPin').value.trim();
-    state.settings.leftHanded = document.getElementById('cfgLeftHand').checked;
+    const handSel = document.getElementById('cfgHandSide');
+    state.settings.leftHanded = handSel ? handSel.value === 'left' : false;
     state.settings.theme = document.getElementById('cfgTheme').value;
     state.settings.carNames = {
       peugeot: document.getElementById('cfgNamePeugeot').value.trim() || 'Peugeot e5008',
@@ -976,7 +1121,7 @@
     }
 
     const micBtn = document.getElementById('btnMic');
-    micBtn.className = 'btn-mic' + (state.voiceListening ? ' listening' : '');
+    micBtn.className = 'btn-mic' + ((state.voiceListening || state.voiceSessionActive) ? ' listening' : '');
 
     // 8. BOTTOM CAR TABS
     document.getElementById('bottomTabs').innerHTML = ['peugeot', 'merco'].map(cid => {
@@ -1011,23 +1156,74 @@
     const open = Boolean(car.openSession);
 
     if (state.activeSheet === 'voice') {
+      const isActive = state.voiceListening || state.voiceSessionActive;
+      let pillsHtml = '';
+      let nextHint = '';
+      if (open) {
+        const hasP = draft.pctEnd !== '';
+        const hasR = draft.rangeEnd !== '';
+        pillsHtml = `
+          <div class="voice-pills cols-2 tabular">
+            <div class="voice-pill ${hasP ? 'filled' : 'next'}">
+              <span class="voice-pill-label">${hasP ? '✓ % fin' : '1. % fin'}</span>
+              <span class="voice-pill-val">${hasP ? escapeHtml(draft.pctEnd) + ' %' : '…'}</span>
+            </div>
+            <div class="voice-pill ${hasR ? 'filled' : (hasP ? 'next' : '')}">
+              <span class="voice-pill-label">${hasR ? '✓ Autonomie' : '2. Autonomie'}</span>
+              <span class="voice-pill-val">${hasR ? fmtNum(draft.rangeEnd) + ' km' : '…'}</span>
+            </div>
+          </div>
+        `;
+        nextHint = !hasP && !hasR
+          ? 'Dictez les <strong>2 valeurs</strong> d\'un coup ou avec une pause : <em>« 80 pour cent, 315 km »</em>'
+          : (!hasR ? 'Parfait ! Dites maintenant l\'<strong>autonomie restante</strong> (km)...' : 'Parfait ! Dites le <strong>pourcentage de fin</strong>...');
+      } else {
+        const hasK = draft.km !== '';
+        const hasP = draft.pctStart !== '';
+        const hasR = draft.rangeStart !== '';
+        pillsHtml = `
+          <div class="voice-pills cols-3 tabular">
+            <div class="voice-pill ${hasK ? 'filled' : 'next'}">
+              <span class="voice-pill-label">${hasK ? '✓ Km' : '1. Km'}</span>
+              <span class="voice-pill-val">${hasK ? fmtNum(draft.km) : '…'}</span>
+            </div>
+            <div class="voice-pill ${hasP ? 'filled' : (hasK ? 'next' : '')}">
+              <span class="voice-pill-label">${hasP ? '✓ % début' : '2. % début'}</span>
+              <span class="voice-pill-val">${hasP ? escapeHtml(draft.pctStart) + ' %' : '…'}</span>
+            </div>
+            <div class="voice-pill ${hasR ? 'filled' : (hasK && hasP ? 'next' : '')}">
+              <span class="voice-pill-label">${hasR ? '✓ Auton.' : '3. Auton.'}</span>
+              <span class="voice-pill-val">${hasR ? fmtNum(draft.rangeStart) + ' km' : '…'}</span>
+            </div>
+          </div>
+        `;
+        if (!hasK && !hasP && !hasR) {
+          nextHint = 'Dictez les <strong>3 valeurs</strong> d\'un coup ou une par une : <em>« 32 120 km, 42 %, 145 km »</em>';
+        } else if (!hasK) {
+          nextHint = 'Dites maintenant le <strong>kilométrage</strong> du compteur...';
+        } else if (!hasP) {
+          nextHint = 'Continuez avec le <strong>% début</strong> et l\'<strong>autonomie</strong>...';
+        } else {
+          nextHint = 'Plus que l\'<strong>autonomie</strong> en km...';
+        }
+      }
+
       sheet.innerHTML = `
         <div class="sheet-header">
-          <div class="sheet-title">🎙️ ${state.voiceListening ? 'Écoute en cours (fr-BE)...' : 'Dictée vocale'}</div>
-          <button class="btn-small" onclick="App.closeSheet()">Fermer</button>
+          <div class="sheet-title">${isActive ? '🔴 Écoute continue (fr-BE)...' : 'Dictée vocale (1 seul appui)'}</div>
+          <div style="display:flex;gap:6px">
+            <button class="btn-small" onclick="App.resetVoiceFields()">↺ Effacer</button>
+            <button class="btn-small" onclick="App.closeSheet()">OK</button>
+          </div>
         </div>
-        <div class="info-box">
-          ${open
-            ? 'Ex. : <strong>« 80 pour cent, 315 kilomètres »</strong> ou <strong>« nonante %, 360 »</strong>'
-            : 'Ex. : <strong>« 32 120 km, 42 %, 145 km »</strong> (+ nom de borne si hors maison)'
-          }
-        </div>
+        ${pillsHtml}
+        <div class="info-box">${nextHint}</div>
         ${state.voiceInterim ? `<div class="voice-banner"><span>🗣️ ${escapeHtml(state.voiceInterim)}</span></div>` : ''}
         ${state.voiceError ? `<div class="info-box warn">${escapeHtml(state.voiceError)}</div>` : ''}
-        <button class="${state.voiceListening ? 'btn-danger-full' : 'btn-primary-full'}" onclick="${state.voiceListening ? 'App.stopVoice()' : 'App.startVoice()'}">
-          ${state.voiceListening ? '⏹ Arrêter l\'écoute' : '🎙️ Réessayer avec le micro'}
+        <button class="${isActive ? 'btn-danger-full' : 'btn-primary-full'}" onclick="${isActive ? 'App.stopVoice()' : 'App.startVoice()'}">
+          ${isActive ? '⏹ Arrêter l\'écoute' : 'Reprendre la dictée'}
         </button>
-        <form onsubmit="event.preventDefault(); const v = document.getElementById('manualVoiceText').value.trim(); if (v) App.applyVoiceText(v);" style="display:flex;gap:6px">
+        <form onsubmit="event.preventDefault(); const v = document.getElementById('manualVoiceText').value.trim(); if (v) App.applyVoiceText(v, false);" style="display:flex;gap:6px">
           <input id="manualVoiceText" class="text-input" placeholder="Ou dicter via clavier Android..." />
           <button type="submit" class="btn-small" style="white-space:nowrap">OK</button>
         </form>
@@ -1121,18 +1317,19 @@
           </div>
           <div class="fields-grid">
             <div class="form-group">
+              <label>Position micro & clavier</label>
+              <select id="cfgHandSide" class="text-input">
+                <option value="right" ${!state.settings.leftHanded ? 'selected' : ''}>✋ Droitier (à droite)</option>
+                <option value="left" ${state.settings.leftHanded ? 'selected' : ''}>🤚 Gaucher (à gauche)</option>
+              </select>
+            </div>
+            <div class="form-group">
               <label>Thème</label>
               <select id="cfgTheme" class="text-input">
                 <option value="auto" ${state.settings.theme === 'auto' ? 'selected' : ''}>Automatique</option>
                 <option value="dark" ${state.settings.theme === 'dark' ? 'selected' : ''}>Sombre</option>
                 <option value="light" ${state.settings.theme === 'light' ? 'selected' : ''}>Clair</option>
               </select>
-            </div>
-            <div class="form-group" style="justify-content:flex-end">
-              <label style="display:flex;align-items:center;gap:8px;padding:10px 8px;cursor:pointer;color:var(--text)">
-                <input id="cfgLeftHand" type="checkbox" ${state.settings.leftHanded ? 'checked' : ''} />
-                <span>Mode gaucher</span>
-              </label>
             </div>
           </div>
           <button type="submit" class="btn-primary-full">Enregistrer et synchroniser</button>
@@ -1155,6 +1352,7 @@
     openAndStartVoice,
     startVoice,
     stopVoice,
+    resetVoiceFields,
     applyVoiceText,
     clearTranscript: () => { state.lastTranscript = ''; render(); },
     openSheet,
@@ -1170,9 +1368,23 @@
     }
   };
 
-  // Init
+  // Synchronisation automatique multi-téléphones (au retour sur l'app ou reprise réseau)
   window.addEventListener('online', () => {
-    if (state.queue.length > 0) flushQueue();
+    autoSyncIfStale(0);
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      autoSyncIfStale(4000);
+    }
+  });
+
+  window.addEventListener('focus', () => {
+    autoSyncIfStale(4000);
+  });
+
+  window.addEventListener('pageshow', () => {
+    autoSyncIfStale(4000);
   });
 
   if ('serviceWorker' in navigator) {

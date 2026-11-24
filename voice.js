@@ -1,11 +1,11 @@
 /**
  * Module de reconnaissance vocale fr-BE (Web Speech API)
- * + analyseur intelligent de phrases EV en français / français de Belgique.
+ * + analyseur intelligent (en 1 phrase ou en plusieurs temps) pour EV en français / français de Belgique.
  */
 (function (global) {
   'use strict';
 
-  function normalizeFrenchNumbers(input, isOpenSession) {
+  function normalizeFrenchNumbers(input, isOpenSession, hasExistingKm) {
     let s = String(input || '')
       .toLowerCase()
       .normalize('NFD')
@@ -85,20 +85,37 @@
     // 1. Milliers séparés par point ("16.985" -> "16985")
     s = s.replace(/\b(\d{1,3})\.(\d{3})\b/g, '$1$2');
 
-    // 2. En début de charge uniquement, fusionne le premier millier séparé par espace ("32 120" -> "32120")
+    // 2. En début de charge uniquement (et si le km n'est pas déjà rempli),
+    //    fusionne le premier millier séparé par espace ("32 120" -> "32120")
     //    seulement s'il n'y a pas déjà un kilométrage >= 1000 dans la phrase
-    if (!isOpenSession && !/\b\d{4,6}\b/.test(s)) {
+    if (!isOpenSession && !hasExistingKm && !/\b\d{4,6}\b/.test(s)) {
       s = s.replace(/\b(\d{1,3})\s(\d{3})\b/, '$1$2');
     }
     return s;
   }
 
+  function detectVoiceCommand(rawText) {
+    const s = String(rawText || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .trim();
+    if (/^(effacer|recommencer|reprendre|corriger|vider)$/.test(s)) return 'reset';
+    if (/^(stop|termine|fini|arreter|annuler)$/.test(s)) return 'stop';
+    return null;
+  }
+
   /**
-   * Analyse une phrase dictée et renvoie { km, pct, range, place }
+   * Analyse une phrase dictée (complète ou incrémentale) et renvoie { km, pct, range, place, command }
+   * existing (optionnel) : { km: boolean, pct: boolean, range: boolean } indique les champs déjà remplis
    */
-  function parseFrenchVoice(rawText, isOpenSession, frequentPlaces) {
-    const text = normalizeFrenchNumbers(rawText, isOpenSession);
-    const result = { km: null, pct: null, range: null, place: null };
+  function parseFrenchVoice(rawText, isOpenSession, frequentPlaces, existing) {
+    const ext = existing || { km: false, pct: false, range: false };
+    const command = detectVoiceCommand(rawText);
+    const text = normalizeFrenchNumbers(rawText, isOpenSession, Boolean(ext.km));
+    const result = { km: null, pct: null, range: null, place: null, command: command };
+    if (command) return result;
+
     const places = Array.isArray(frequentPlaces) ? frequentPlaces : [];
 
     // 1. Détection éventuelle d'un lieu de charge
@@ -136,10 +153,18 @@
       matches.push({ num, isPct, isRange, isKmUnit });
     }
 
+    if (matches.length === 0) return result;
+
     if (isOpenSession) {
       // Fin de charge : % fin + autonomie fin
+      // Si un seul nombre sans unité et que % est déjà rempli mais pas autonomie -> autonomie (même <= 100 km)
+      if (matches.length === 1 && !matches[0].isPct && ext.pct && !ext.range) {
+        result.range = matches[0].num;
+        return result;
+      }
+
       const pctItem = matches.find(function (x) { return x.isPct; }) ||
-        matches.find(function (x) { return x.num <= 100 && !x.isRange && !x.isKmUnit; });
+        (!ext.pct ? matches.find(function (x) { return x.num <= 100 && !x.isRange && !x.isKmUnit; }) : null);
       if (pctItem && pctItem.num <= 100) result.pct = pctItem.num;
 
       const remaining = matches.filter(function (x) { return x !== pctItem; });
@@ -147,13 +172,30 @@
       if (rangeItem) result.range = rangeItem.num;
     } else {
       // Début de charge : Kilométrage + % début + autonomie début
+      // Cas incrémental à 1 seul nombre sans unité explicite
+      if (matches.length === 1 && !matches[0].isPct && !matches[0].isRange) {
+        const only = matches[0];
+        if (!ext.km && only.num >= 900) {
+          result.km = only.num;
+          return result;
+        }
+        if (ext.km && ext.pct && !ext.range && only.num < 900) {
+          result.range = only.num;
+          return result;
+        }
+        if (ext.km && !ext.pct && only.num <= 100 && !only.isKmUnit) {
+          result.pct = only.num;
+          return result;
+        }
+      }
+
       const kmItem = matches.find(function (x) { return x.num >= 900; }) ||
-        (matches.length >= 3 ? matches[0] : null);
+        (!ext.km && matches.length >= 3 ? matches[0] : null);
       if (kmItem) result.km = kmItem.num;
 
       const rem1 = matches.filter(function (x) { return x !== kmItem; });
       const pctItem = rem1.find(function (x) { return x.isPct; }) ||
-        rem1.find(function (x) { return x.num <= 100 && !x.isRange; });
+        (!ext.pct ? rem1.find(function (x) { return x.num <= 100 && !x.isRange; }) : null);
       if (pctItem && pctItem.num <= 100) result.pct = pctItem.num;
 
       const rem2 = rem1.filter(function (x) { return x !== pctItem; });
@@ -169,6 +211,7 @@
       return typeof window !== 'undefined' && !!(window.SpeechRecognition || window.webkitSpeechRecognition);
     },
     normalizeFrenchNumbers: normalizeFrenchNumbers,
+    detectVoiceCommand: detectVoiceCommand,
     parseFrenchVoice: parseFrenchVoice,
     createRecognizer: function (lang) {
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
